@@ -310,28 +310,9 @@ impl RegistrationContract {
             return Err(ScoutChainError::PlayerCapReached);
         }
 
-        // Validate player age: must be at least MIN_PLAYER_AGE
-        if vitals.age == 0 || vitals.age < MIN_PLAYER_AGE {
-            return Err(ScoutChainError::InvalidInput);
-        }
-
-        // Validate vitals string lengths
-        if vitals.position.len() > MAX_STRING_LEN
-            || vitals.region.len() > MAX_REGION_LEN
-            || vitals.nationality.len() > MAX_STRING_LEN
-        {
-            return Err(ScoutChainError::InvalidInput);
-        }
-
-        // Validate age upper bound
-        if vitals.age > MAX_PLAYER_AGE {
-            return Err(ScoutChainError::InvalidInput);
-        }
-
-        // Validate ipfs_hashes: non-empty and at most MAX_IPFS_HASHES
-        if ipfs_hashes.is_empty() || ipfs_hashes.len() > MAX_IPFS_HASHES {
-            return Err(ScoutChainError::InvalidInput);
-        }
+        // Validate player vitals and IPFS hashes via shared helpers.
+        Self::validate_vitals(&vitals)?;
+        Self::validate_ipfs_hashes(&ipfs_hashes)?;
 
         let player_id = Self::next_player_id(&env)?;
         let now = env.ledger().timestamp();
@@ -405,9 +386,7 @@ impl RegistrationContract {
         Self::require_initialized(&env)?;
         let mut profile = Self::load_stored_player(&env, player_id)?;
         profile.wallet.require_auth();
-        if ipfs_hashes.is_empty() || ipfs_hashes.len() > MAX_IPFS_HASHES {
-            return Err(ScoutChainError::InvalidInput);
-        }
+        Self::validate_ipfs_hashes(&ipfs_hashes)?;
         profile.ipfs_hashes = ipfs_hashes;
         profile.updated_at = env.ledger().timestamp();
         env.storage()
@@ -576,21 +555,12 @@ impl RegistrationContract {
             return Err(ScoutChainError::AlreadyRegistered);
         }
 
-        if vitals.age == 0 || vitals.age < MIN_PLAYER_AGE {
-            return Err(ScoutChainError::InvalidInput);
-        }
-        if vitals.position.len() > MAX_STRING_LEN
-            || vitals.region.len() > MAX_REGION_LEN
-            || vitals.nationality.len() > MAX_STRING_LEN
-        {
-            return Err(ScoutChainError::InvalidInput);
-        }
-        if vitals.age > MAX_PLAYER_AGE {
-            return Err(ScoutChainError::InvalidInput);
-        }
-        if ipfs_hashes.is_empty() || ipfs_hashes.len() > MAX_IPFS_HASHES {
-            return Err(ScoutChainError::InvalidInput);
-        }
+        // Validate player vitals and IPFS hashes via shared helpers.
+        // Note: the redundant `vitals.age == 0 ||` check previously present
+        // here is removed; age == 0 is already rejected by validate_vitals
+        // since 0 < MIN_PLAYER_AGE (16).
+        Self::validate_vitals(&vitals)?;
+        Self::validate_ipfs_hashes(&ipfs_hashes)?;
 
         let stored = StoredPlayerProfile {
             player_id,
@@ -1356,6 +1326,39 @@ impl RegistrationContract {
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
+
+    /// Validate player vitals for registration or seeding.
+    ///
+    /// Rules enforced:
+    /// - `age` must be in the range `[MIN_PLAYER_AGE, MAX_PLAYER_AGE]` (16–100).
+    ///   The redundant `age == 0` pre-check is intentionally omitted: any age
+    ///   below `MIN_PLAYER_AGE` (including 0) is already covered by the lower
+    ///   bound.
+    /// - `position` ≤ 64 bytes, `region` ≤ 100 bytes, `nationality` ≤ 64 bytes.
+    fn validate_vitals(vitals: &PlayerVitals) -> Result<(), ScoutChainError> {
+        if vitals.age < MIN_PLAYER_AGE || vitals.age > MAX_PLAYER_AGE {
+            return Err(ScoutChainError::InvalidInput);
+        }
+        if vitals.position.len() > MAX_STRING_LEN
+            || vitals.region.len() > MAX_REGION_LEN
+            || vitals.nationality.len() > MAX_STRING_LEN
+        {
+            return Err(ScoutChainError::InvalidInput);
+        }
+        Ok(())
+    }
+
+    /// Validate the list of IPFS/Arweave content hashes for a player profile.
+    ///
+    /// Rules enforced:
+    /// - The list must not be empty (at least one CID is required).
+    /// - The list must not exceed `MAX_IPFS_HASHES` (10) entries.
+    fn validate_ipfs_hashes(ipfs_hashes: &Vec<String>) -> Result<(), ScoutChainError> {
+        if ipfs_hashes.is_empty() || ipfs_hashes.len() > MAX_IPFS_HASHES {
+            return Err(ScoutChainError::InvalidInput);
+        }
+        Ok(())
+    }
 
     fn require_initialized(env: &Env) -> Result<(), ScoutChainError> {
         if !env
@@ -3848,5 +3851,134 @@ mod tests {
         let record = client.get_scout_verification(&scout_id);
         assert!(record.verified);
         assert!(record.verified_by.is_some());
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #1441: validate_vitals / validate_ipfs_hashes helper boundary tests
+    // -------------------------------------------------------------------------
+
+    /// Age 15 (one below MIN_PLAYER_AGE) must be rejected.
+    #[test]
+    fn test_validate_vitals_age_15_rejected() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let vitals = PlayerVitals {
+            age: 15,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "West Africa"),
+            nationality: String::from_str(&env, "Ghana"),
+        };
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+        let result = client.try_register_player(&wallet, &vitals, &hashes);
+        assert_eq!(result, Err(Ok(ScoutChainError::InvalidInput)));
+    }
+
+    /// Age 16 (MIN_PLAYER_AGE) must be accepted.
+    #[test]
+    fn test_validate_vitals_age_16_accepted() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let vitals = PlayerVitals {
+            age: 16,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "West Africa"),
+            nationality: String::from_str(&env, "Ghana"),
+        };
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+        let result = client.try_register_player(&wallet, &vitals, &hashes);
+        assert!(result.is_ok(), "age 16 should register successfully");
+    }
+
+    /// Age 100 (MAX_PLAYER_AGE) must be accepted.
+    #[test]
+    fn test_validate_vitals_age_100_accepted() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let vitals = PlayerVitals {
+            age: 100,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "West Africa"),
+            nationality: String::from_str(&env, "Ghana"),
+        };
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+        let result = client.try_register_player(&wallet, &vitals, &hashes);
+        assert!(result.is_ok(), "age 100 should register successfully");
+    }
+
+    /// Age 101 (one above MAX_PLAYER_AGE) must be rejected.
+    #[test]
+    fn test_validate_vitals_age_101_rejected() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let vitals = PlayerVitals {
+            age: 101,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "West Africa"),
+            nationality: String::from_str(&env, "Ghana"),
+        };
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+        let result = client.try_register_player(&wallet, &vitals, &hashes);
+        assert_eq!(result, Err(Ok(ScoutChainError::InvalidInput)));
+    }
+
+    /// admin_seed_player must also use the shared validate_vitals helper,
+    /// so age 15 is rejected through that path as well (no redundant age==0
+    /// check in admin_seed_player any more).
+    #[test]
+    fn test_admin_seed_player_age_15_rejected_via_helper() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let vitals = PlayerVitals {
+            age: 15,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "West Africa"),
+            nationality: String::from_str(&env, "Ghana"),
+        };
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+        let result = client.try_admin_seed_player(
+            &wallet,
+            &vitals,
+            &hashes,
+            &ProgressLevel::Unverified,
+            &1u64,
+            &0u64,
+            &0u64,
+        );
+        assert_eq!(result, Err(Ok(ScoutChainError::InvalidInput)));
+    }
+
+    /// Age 0 must be rejected — validate_vitals covers this without a redundant
+    /// explicit age == 0 guard.
+    #[test]
+    fn test_validate_vitals_age_zero_rejected() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let vitals = PlayerVitals {
+            age: 0,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "West Africa"),
+            nationality: String::from_str(&env, "Ghana"),
+        };
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+        let result = client.try_register_player(&wallet, &vitals, &hashes);
+        assert_eq!(result, Err(Ok(ScoutChainError::InvalidInput)));
     }
 }
