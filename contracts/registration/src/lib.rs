@@ -751,7 +751,7 @@ impl RegistrationContract {
         }
 
         let message = Self::migration_message(&env, &authorization);
-        let public_key = Self::address_to_ed25519_key(&env, &wallet);
+        let public_key = Self::address_to_ed25519_key(&env, &wallet)?;
         // ed25519_verify panics on invalid signature rather than returning bool;
         // wrap in a check via a no-panic approach — invoke and treat panic as invalid.
         env.crypto()
@@ -827,7 +827,7 @@ impl RegistrationContract {
         }
 
         let message = Self::migration_message(&env, &authorization);
-        let public_key = Self::address_to_ed25519_key(&env, &wallet);
+        let public_key = Self::address_to_ed25519_key(&env, &wallet)?;
         env.crypto()
             .ed25519_verify(&public_key, &message, &authorization.signature);
 
@@ -928,12 +928,25 @@ impl RegistrationContract {
             .extend_ttl(&key, PERSISTENT_TTL_MAX, PERSISTENT_TTL_MAX);
     }
 
-    /// Derive an ed25519 public key BytesN<32> from a G-address.
-    fn address_to_ed25519_key(env: &Env, address: &Address) -> BytesN<32> {
+    /// Derive an ed25519 public key `BytesN<32>` from a Stellar G-address.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(ScoutChainError::InvalidInput)` for any address that is not
+    /// a classic ed25519 account (G-address).  In practice this means contract
+    /// addresses (C-addresses) and smart-wallet addresses are rejected here.
+    ///
+    /// **Why this matters**: migration tickets can only be signed with a private
+    /// key that corresponds to a G-address.  Contract addresses have no such key,
+    /// so attempting to verify a signature against an all-zero public key would
+    /// trap the host with an opaque error instead of returning a meaningful
+    /// contract error.  Failing early with `InvalidInput` makes the limitation
+    /// explicit and diagnosable.
+    fn address_to_ed25519_key(env: &Env, address: &Address) -> Result<BytesN<32>, ScoutChainError> {
         use soroban_sdk::address_payload::AddressPayload;
         match AddressPayload::from_address(address) {
-            Some(AddressPayload::AccountIdPublicKeyEd25519(key)) => key,
-            _ => BytesN::from_array(env, &[0u8; 32]),
+            Some(AddressPayload::AccountIdPublicKeyEd25519(key)) => Ok(key),
+            _ => Err(ScoutChainError::InvalidInput),
         }
     }
 
@@ -3848,5 +3861,98 @@ mod tests {
         let record = client.get_scout_verification(&scout_id);
         assert!(record.verified);
         assert!(record.verified_by.is_some());
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #1443: address_to_ed25519_key must return a typed error for
+    // non-account (C-address / contract) addresses instead of silently
+    // returning an all-zero key that traps ed25519_verify.
+    // -------------------------------------------------------------------------
+
+    /// Calling redeem_migration_player with a contract address as `wallet`
+    /// must return `InvalidInput` rather than trapping with an opaque host error.
+    ///
+    /// A contract address (C-address) has no ed25519 private key, so migration
+    /// tickets cannot be signed for it.  The contract should surface this
+    /// limitation explicitly.
+    #[test]
+    fn test_redeem_migration_player_contract_address_returns_invalid_input() {
+        use soroban_sdk::Bytes;
+
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        // Register a dummy contract to obtain a C-address.
+        let contract_addr = env.register(RegistrationContract, ());
+
+        let vitals = dummy_vitals(&env);
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+
+        // Build a syntactically valid (but semantically invalid) authorization.
+        // The signature bytes are arbitrary — we expect the call to fail before
+        // ed25519_verify is even reached because address_to_ed25519_key now
+        // returns InvalidInput for contract addresses.
+        let authorization = MigrationAuthorization {
+            wallet: contract_addr.clone(),
+            role: MigrationRole::Player,
+            profile_data_hash: Bytes::new(&env),
+            new_contract_hint: contract_addr.clone(),
+            nonce: 1,
+            expires_at: 0,
+            signature: soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
+        };
+
+        let result = client.try_redeem_migration_player(
+            &contract_addr,
+            &vitals,
+            &hashes,
+            &ProgressLevel::Unverified,
+            &1u64,
+            &0u64,
+            &0u64,
+            &authorization,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(ScoutChainError::InvalidInput)),
+            "contract address should return InvalidInput, not trap"
+        );
+    }
+
+    /// Same check for the scout migration path.
+    #[test]
+    fn test_redeem_migration_scout_contract_address_returns_invalid_input() {
+        use soroban_sdk::Bytes;
+
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let contract_addr = env.register(RegistrationContract, ());
+
+        let authorization = MigrationAuthorization {
+            wallet: contract_addr.clone(),
+            role: MigrationRole::Scout,
+            profile_data_hash: Bytes::new(&env),
+            new_contract_hint: contract_addr.clone(),
+            nonce: 1,
+            expires_at: 0,
+            signature: soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
+        };
+
+        let result = client.try_redeem_migration_scout(
+            &contract_addr,
+            &String::from_str(&env, "Europe"),
+            &1u64,
+            &0u64,
+            &false,
+            &authorization,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(ScoutChainError::InvalidInput)),
+            "contract address should return InvalidInput, not trap"
+        );
     }
 }
