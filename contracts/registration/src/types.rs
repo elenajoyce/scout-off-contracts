@@ -226,10 +226,6 @@ pub enum DataKey {
     /// Last registration timestamp for a scout wallet (Unix seconds).
     /// Set by `register_scout` and read to enforce the per-caller cooldown.
     ScoutRegLastSent(Address),
-    /// Last registration timestamp for a validator wallet (Unix seconds).
-    /// Set by `register_validator` in the verification contract; mirrored here
-    /// via the same DataKey convention for cross-contract inspection.
-    ValidatorRegLastSent(Address),
     /// Cooldown in seconds between repeated registration attempts from the
     /// same wallet. 0 means no cooldown. Configurable by admin.
     RegCooldownSecs(u64), // ── Migration ticket replay prevention ──
